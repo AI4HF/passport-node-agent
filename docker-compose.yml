@@ -1,0 +1,45 @@
+# One agent, three modules, one configuration per hospital.
+#
+# Each module is a separate service because each has its own trigger and its own identity. None of
+# them is a daemon: bring one up when its moment arrives.
+#
+#   docker compose run --rm dataset-sync
+#   docker compose run --rm metadata-publisher
+#   docker compose run --rm monitoring-import --model-id <replaced-model> --period-start ... --period-end ...
+#
+# Settings come from .env - copy .env.example and fill it in. Nothing here carries a credential.
+
+x-site: &site
+  build: .
+  env_file: .env
+  environment:
+    PASSPORT_SERVER_URL: ${PASSPORT_SERVER_URL}
+    KEYCLOAK_SERVER_URL: ${KEYCLOAK_SERVER_URL}
+    KEYCLOAK_REALM: ${KEYCLOAK_REALM:-AI4HF-Authorization}
+    STUDY_ID: ${STUDY_ID}
+    ORGANIZATION_ID: ${ORGANIZATION_ID}
+  networks:
+    - passport-network
+
+services:
+  # After the site has run $$extract: record what was extracted, and optionally run $$quality.
+  dataset-sync:
+    <<: *site
+    command: ["dataset-sync"]
+    volumes:
+      # The definitions release this node runs, so the quality criteria rules can be read.
+      - ${DEFINITIONS_DIR:-./definitions}:/opt/definitions:ro
+
+  # After a Data Steward approves publication: publish to the site's own FDP.
+  metadata-publisher:
+    <<: *site
+    command: ["metadata-publisher"]
+
+  # At retraining: import the replaced model's deployment-period statistics.
+  monitoring-import:
+    <<: *site
+    command: ["monitoring-import"]
+
+networks:
+  passport-network:
+    external: true
