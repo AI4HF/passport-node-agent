@@ -68,6 +68,8 @@ class AgentConfig:
     fdp_url: Optional[str] = None
     fdp_catalog_id: Optional[str] = None
     fdp_token: Optional[str] = None
+    fdp_email: Optional[str] = None
+    fdp_password: Optional[str] = None
 
     # monitoring-import
     elasticsearch_url: Optional[str] = None
@@ -111,6 +113,8 @@ def load(module: str) -> AgentConfig:
         fdp_url=(os.getenv("FDP_URL") or "").rstrip("/") or None,
         fdp_catalog_id=os.getenv("FDP_CATALOG_ID"),
         fdp_token=os.getenv("FDP_TOKEN"),
+        fdp_email=os.getenv("FDP_EMAIL"),
+        fdp_password=os.getenv("FDP_PASSWORD"),
         elasticsearch_url=(os.getenv("ELASTICSEARCH_URL") or "").rstrip("/") or None,
         elasticsearch_index=os.getenv("ELASTICSEARCH_INDEX", "evaluation-measures-*"),
         elasticsearch_basic_auth=os.getenv("ELASTICSEARCH_BASIC_AUTH"),
@@ -137,6 +141,10 @@ def require_for_metadata_publisher(config: AgentConfig) -> None:
     """Check the settings the metadata-publisher module needs beyond the shared ones."""
     if not config.fdp_url:
         raise ConfigError("metadata-publisher requires FDP_URL")
+    if not config.fdp_catalog_id:
+        raise ConfigError("metadata-publisher requires FDP_CATALOG_ID: the catalog the datasets are listed in")
+    if not config.fdp_token and not (config.fdp_email and config.fdp_password):
+        raise ConfigError("metadata-publisher requires FDP_EMAIL and FDP_PASSWORD (or FDP_TOKEN)")
 
 
 def require_for_monitoring_import(config: AgentConfig) -> None:

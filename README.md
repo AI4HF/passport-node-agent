@@ -57,12 +57,23 @@ writes require:
 Every write is lookup-then-create, keyed on what identifies the record in the domain:
 
 - a definition by `(url, version)`,
-- a dataset by the extraction that produced it (`wasGeneratedBy`),
-- an evaluation by `(model, organization, period)`.
+- a dataset by the extraction that produced it (the Studyfyr job id in `wasGeneratedBy`, whatever
+  address `FEAST_URL` reaches Studyfyr at),
+- a quality assessment by `(dataset, criteria definition)` — `$quality` runs once; results missing
+  from an existing assessment are added to it (evaluating again only then),
+- an evaluation by `(model, organization, period)`, whatever `--reason` says and however the period
+  is typed (`2026-03-31` and `2026-03-31T23:59:59Z` are the same end; a bound is a `YYYY-MM-DD` date
+  or a full ISO-8601 timestamp, and `--period-start`/`--period-end` are given both or neither);
+  measures missing from an existing evaluation are added to it.
 
 So a run interrupted half way can simply be run again: it completes the work rather than creating a
 second copy of it. The prototype connectors this replaces duplicated everything on every run, which
 is why they could not be scheduled.
+
+The exception is `metadata-publisher`: every run publishes every approved dataset again, as a new
+FDP entry with a new `CatalogueRegistration` ("updated" once the dataset was listed before). A dataset
+the FDP rejects stops the run (code 1). A failed FDP login (`FDP_EMAIL`/`FDP_PASSWORD`, or `FDP_TOKEN`)
+or an FDP that cannot be reached (`FDP_URL`) stops the run with code 3, as a failed Passport login does.
 
 ## Definition versions
 
