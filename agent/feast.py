@@ -111,7 +111,13 @@ class DefinitionsDirectory:
                         doc = json.load(handle)
                 except (ValueError, OSError):
                     continue
-                if doc.get("resourceType") != "DatasetQualityCriteria":
+                # The definitions repository's criteria files carry no resourceType; Studyfyr knows them by
+                # their folder. Accept either form: a typed resource, or a document holding a criteria list.
+                if not isinstance(doc, dict):
+                    continue
+                if doc.get("resourceType") not in (None, "DatasetQualityCriteria"):
+                    continue
+                if doc.get("resourceType") is None and not isinstance(doc.get("criteria"), list):
                     continue
                 if (canonical_url and doc.get("url") == canonical_url) or doc.get("id") == definition_id:
                     logger.debug("Matched quality criteria definition in %s", full)

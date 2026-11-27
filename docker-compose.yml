@@ -9,15 +9,17 @@
 #
 # Settings come from .env - copy .env.example and fill it in. Nothing here carries a credential.
 
+x-site-environment: &site-environment
+  PASSPORT_SERVER_URL: ${PASSPORT_SERVER_URL}
+  KEYCLOAK_SERVER_URL: ${KEYCLOAK_SERVER_URL}
+  KEYCLOAK_REALM: ${KEYCLOAK_REALM:-AI4HF-Authorization}
+  STUDY_ID: ${STUDY_ID}
+  ORGANIZATION_ID: ${ORGANIZATION_ID}
+
 x-site: &site
   build: .
   env_file: .env
-  environment:
-    PASSPORT_SERVER_URL: ${PASSPORT_SERVER_URL}
-    KEYCLOAK_SERVER_URL: ${KEYCLOAK_SERVER_URL}
-    KEYCLOAK_REALM: ${KEYCLOAK_REALM:-AI4HF-Authorization}
-    STUDY_ID: ${STUDY_ID}
-    ORGANIZATION_ID: ${ORGANIZATION_ID}
+  environment: *site-environment
   networks:
     - passport-network
 
@@ -26,9 +28,14 @@ services:
   dataset-sync:
     <<: *site
     command: ["dataset-sync"]
+    environment:
+      <<: *site-environment
+      # Inside the container the definitions are always here; DEFINITIONS_DIR from .env (a path on a
+      # machine running the agent without Docker) does not apply.
+      DEFINITIONS_DIR: /opt/definitions
     volumes:
-      # The definitions release this node runs, so the quality criteria rules can be read.
-      - ${DEFINITIONS_DIR:-./definitions}:/opt/definitions:ro
+      # The definitions release this node runs (a path on the host), so the quality criteria rules can be read.
+      - ${DEFINITIONS_HOST_DIR:-./definitions}:/opt/definitions:ro
 
   # After a Data Steward approves publication: publish to the site's own FDP.
   metadata-publisher:
@@ -38,7 +45,10 @@ services:
   # At retraining: import the replaced model's deployment-period statistics.
   monitoring-import:
     <<: *site
-    command: ["monitoring-import"]
+    # The module is part of the entrypoint, so `run --rm monitoring-import --model-id ...` passes only the
+    # options (arguments given to `run` replace the command, which would drop the module name)
+    entrypoint: ["python", "-m", "agent", "monitoring-import"]
+    command: []
 
 networks:
   passport-network:

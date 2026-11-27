@@ -42,8 +42,14 @@ def _parser() -> argparse.ArgumentParser:
         "--model-id",
         help="the model being replaced; its deployment period is what gets imported",
     )
-    retraining.add_argument("--period-start", help="ISO-8601 start of the deployment period")
-    retraining.add_argument("--period-end", help="ISO-8601 end of the deployment period")
+    retraining.add_argument(
+        "--period-start",
+        help="start of the deployment period: YYYY-MM-DD or an ISO-8601 timestamp (give both bounds or neither)",
+    )
+    retraining.add_argument(
+        "--period-end",
+        help="end of the deployment period: YYYY-MM-DD or an ISO-8601 timestamp (give both bounds or neither)",
+    )
     retraining.add_argument("--reason", help="what prompted the retraining")
 
     return parser
@@ -92,6 +98,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "monitoring-import needs --model-id: the model being replaced. "
                     "There is no retraining-event contract yet, so the run is triggered explicitly."
                 )
+            if bool(args.period_start) != bool(args.period_end):
+                raise ConfigError(
+                    "monitoring-import needs both --period-start and --period-end, or neither "
+                    "(neither imports the whole history)"
+                )
+            try:
+                monitoring_import.normalise_period(args.period_start, args.period_end)
+            except ValueError as error:
+                raise ConfigError(f"monitoring-import: {error}") from error
             summary = monitoring_import.run(
                 settings,
                 passport,

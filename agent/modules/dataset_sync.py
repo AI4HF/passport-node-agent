@@ -8,14 +8,16 @@ If quality criteria are configured it then runs ``$quality`` and records the ass
 Two things separate it from the prototype connector it replaces:
 
 * **Idempotency.** Every write is lookup-then-create, keyed on ``(url, version)`` for definitions and
-  on ``(featuresetId, populationId, organizationId, version)`` for a dataset. Re-running converges;
-  the prototype duplicated everything.
+  on the Studyfyr extraction job id recorded in ``wasGeneratedBy`` for a dataset. Re-running
+  converges; the prototype duplicated everything.
 * **Coverage.** The descriptor is richer than the prototype used. The fields it dropped - the
   derivation of each feature, the temporal window, the codings, the cohort size - are the ones v2.7
   added columns for, so they are carried over rather than left to a steward to retype.
 """
 
+import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -76,11 +78,16 @@ def _concept_of(variable: Dict[str, Any]) -> Dict[str, Optional[str]]:
     :return: uri, system and code, any of which may be None
     """
     value_set = variable.get("valueSet") or {}
-    concept = value_set.get("concept") or {}
+    # Studyfyr serialises the binding's concepts as a list of {code, display[, system]}; a single concept
+    # names the code, several only the value set they belong to.
+    concepts = value_set.get("concept") or []
+    if isinstance(concepts, dict):
+        concepts = [concepts]
+    systems = {c.get("system") for c in concepts if c.get("system")}
     return {
-        "conceptUri": value_set.get("url") or concept.get("uri"),
-        "conceptSystem": concept.get("system"),
-        "conceptCode": concept.get("code"),
+        "conceptUri": value_set.get("url") or (concepts[0].get("uri") if len(concepts) == 1 else None),
+        "conceptSystem": value_set.get("system") or (systems.pop() if len(systems) == 1 else None),
+        "conceptCode": concepts[0].get("code") if len(concepts) == 1 else None,
     }
 
 
@@ -188,7 +195,11 @@ def _sync_dataset(
     A dataset is identified by the extraction that produced it. Studyfyr's descriptor id *is* the
     extraction job, so it is recorded as ``wasGeneratedBy`` and used as the identity: re-running the
     agent over the same extraction converges, while a fresh extraction over newer data becomes a new
-    dataset - which is what ``previousDatasetId`` exists to chain.
+    dataset.
+
+    ``wasGeneratedBy`` names the job by its full URL, but only the job id identifies it: the address
+    the agent reaches Studyfyr at (``FEAST_URL``) is deployment detail, and changing it must not turn
+    an extraction already recorded into a new dataset.
     """
     data_source = descriptor.get("dataSource") or {}
     population_stats = descriptor.get("populationStats") or {}
@@ -199,14 +210,40 @@ def _sync_dataset(
     population_id = population.get("populationId")
     version = data_source.get("version")
     # The extraction job, named where it can be looked up again.
-    generated_by = f"{config.feast_url}/Dataset/{descriptor.get('id')}" if descriptor.get("id") else None
+    job_path = f"/Dataset/{descriptor.get('id')}" if descriptor.get("id") else None
+    generated_by = f"{config.feast_url}{job_path}" if job_path else None
+
+    # Same site, same definitions: the only datasets this extraction can already be recorded as.
+    candidates = [
+        d
+        for d in passport.datasets()
+        if d.get("featuresetId") == featureset_id
+        and d.get("populationId") == population_id
+        and d.get("organizationId") == config.organization_id
+    ]
+    if generated_by:
+        # The study listing omits wasGeneratedBy, so the candidates are read in full.
+        full_records = (passport.dataset(d.get("datasetId")) or {} for d in candidates)
+        already = next(
+            (d for d in full_records if (d.get("wasGeneratedBy") or "").endswith(job_path)), None
+        )
+    else:
+        # Without an extraction id only what produced the dataset can identify it.
+        already = next((d for d in candidates if d.get("version") == version), None)
+    if already:
+        logger.info("  = Dataset %s already recorded", already.get("datasetId"))
+        return already
+
+    feature_set_ref = descriptor.get("featureSet") or {}
+    population_ref = descriptor.get("population") or {}
 
     body = {
         "featuresetId": featureset_id,
         "populationId": population_id,
         "organizationId": config.organization_id,
-        "title": descriptor.get("name") or data_source.get("name"),
-        "description": descriptor.get("description") or data_source.get("name"),
+        "title": descriptor.get("name") or feature_set_ref.get("title") or data_source.get("name"),
+        "description": descriptor.get("description")
+        or f"{feature_set_ref.get('title')} extracted for the cohort: {population_ref.get('title')}",
         "version": version,
         "referenceEntity": (descriptor.get("population") or {}).get("title"),
         "numberOfRecords": dataset_stats.get("numOfEntries"),
@@ -220,24 +257,9 @@ def _sync_dataset(
         "provenanceStatement": _provenance_statement(descriptor),
     }
 
-    def matches(existing: Dict[str, Any]) -> bool:
-        if generated_by and existing.get("wasGeneratedBy"):
-            return existing.get("wasGeneratedBy") == generated_by
-        # A dataset recorded before the extraction was tracked falls back to what produced it.
-        return (
-            existing.get("featuresetId") == featureset_id
-            and existing.get("populationId") == population_id
-            and existing.get("organizationId") == config.organization_id
-            and existing.get("version") == version
-        )
-
-    return passport.find_or_create(
-        "/dataset",
-        passport.datasets(),
-        matches,
-        body,
-        f"Dataset from {data_source.get('name')} version {version}",
-    )
+    created = passport.post("/dataset", body)
+    logger.info("  + Dataset %s version %s created", body["title"], version)
+    return created
 
 
 def _provenance_statement(descriptor: Dict[str, Any]) -> str:
@@ -359,7 +381,7 @@ def _sync_characteristics(
             and e.get("characteristicName") == characteristic_name
             for e in existing
         )
-        if already:
+        if already or value is None:
             continue
 
         passport.post(
@@ -368,7 +390,8 @@ def _sync_characteristics(
                 "datasetId": dataset_id,
                 "featureId": feature_id,
                 "characteristicName": characteristic_name,
-                "value": str(value),
+                # Structured statistics (histograms, per-item cardinalities) as JSON, not a Python repr.
+                "value": json.dumps(value) if isinstance(value, (dict, list)) else str(value),
                 "valueDataType": type(value).__name__,
             },
         )
@@ -383,15 +406,17 @@ def _sync_concepts(passport: PassportClient, descriptor: Dict[str, Any], dataset
     """
     dataset_id = dataset.get("datasetId")
     existing = passport.dataset_concepts(dataset_id)
-    seen = {(c.get("conceptUri"), c.get("prefLabel")) for c in existing}
+    # A concept is identified by its uri; the label is presentation and may be curated by a steward later.
+    seen = {c.get("conceptUri") for c in existing}
 
     for variable in (descriptor.get("features") or []) + (descriptor.get("outcomes") or []):
         value_set = variable.get("valueSet") or {}
         uri = value_set.get("url")
-        label = value_set.get("title") or value_set.get("name")
-        if not uri or (uri, label) in seen:
+        # Studyfyr's descriptor carries only the value set url; its last path segment is the best label.
+        label = value_set.get("title") or value_set.get("name") or (uri.rstrip("/").rsplit("/", 1)[-1] if uri else None)
+        if not uri or uri in seen:
             continue
-        seen.add((uri, label))
+        seen.add(uri)
         passport.post(
             "/dataset-concept",
             {
@@ -422,13 +447,23 @@ def _sync_quality(
     The report identifies the criteria definition canonically, so the Passport records which version
     of which rule set produced the result - the same identity the definitions themselves are keyed on.
 
+    One assessment per dataset and criteria definition: every ``$quality`` call is a new execution (new
+    "issued"), so a re-run must not evaluate again and record a second one. An assessment that exists
+    but lacks some of its results (an interrupted run) is completed instead.
+
     :return: how many assessments were recorded
     """
     definitions = DefinitionsDirectory(config.definitions_dir)
     features_by_title = {f.get("title"): f.get("featureId") for f in features}
+    dataset_id = dataset.get("datasetId")
     recorded = 0
 
     for criteria_id in config.quality_criteria_ids:
+        assessment = _existing_assessment(config, passport, definitions, dataset_id, criteria_id)
+        if assessment:
+            _complete_assessment(config, passport, feast, definitions, assessment, criteria_id, features_by_title)
+            continue
+
         report = feast.evaluate_quality(config.dataset_id, criteria_id)
         reference = report.get("criteria") or {}
         url, version = split_canonical(reference.get("url"))
@@ -451,10 +486,95 @@ def _sync_quality(
         criterion_by_name = _sync_criterion(
             passport, definitions, criteria_id_in_passport, url, criteria_id, report, features_by_title
         )
-        _record_assessment(passport, dataset, criteria_id_in_passport, report, criterion_by_name)
-        recorded += 1
+        if _record_assessment(passport, dataset, criteria_id_in_passport, criteria_id, report, criterion_by_name):
+            recorded += 1
 
     return recorded
+
+
+def _criteria_marker(criteria_id: str) -> str:
+    """
+    How an assessment's summary names the Studyfyr criteria definition it ran.
+
+    Studyfyr does not serve the definition, so without the definitions checkout its url and version are
+    unknown until ``$quality`` has run; the summary is what lets a re-run recognise the assessment.
+    """
+    return f"(DatasetQualityCriteria {criteria_id})"
+
+
+def _existing_assessment(
+    config: AgentConfig,
+    passport: PassportClient,
+    definitions: DefinitionsDirectory,
+    dataset_id: str,
+    criteria_id: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    The assessment of this dataset against this criteria definition, if one is recorded.
+
+    Matched on the criteria id the summary names, which needs nothing but the Passport; assessments
+    recorded before the summary carried it are matched on the definition's (url, version) when the
+    definitions checkout holds it.
+    """
+    assessments = passport.quality_assessments(dataset_id)
+    marker = _criteria_marker(criteria_id)
+    for assessment in assessments:
+        if marker in (assessment.get("summary") or ""):
+            return assessment
+
+    definition = definitions.quality_criteria(None, criteria_id)
+    if definition and definition.get("url"):
+        known = {
+            c.get("qualityCriteriaId")
+            for c in passport.quality_criteria(config.experiment_id)
+            if c.get("url") == definition.get("url") and c.get("version") == definition.get("version")
+        }
+        for assessment in assessments:
+            if assessment.get("qualityCriteriaId") in known:
+                return assessment
+    return None
+
+
+def _expected_results(passport: PassportClient, assessment: Dict[str, Any]) -> int:
+    """How many results an assessment was recorded with: its summary says ("3 of 4 criteria passed")."""
+    counted = re.search(r"(\d+) of (\d+) criteria passed", assessment.get("summary") or "")
+    if counted:
+        return int(counted.group(2))
+    return len(passport.quality_criterion(assessment.get("qualityCriteriaId")))
+
+
+def _complete_assessment(
+    config: AgentConfig,
+    passport: PassportClient,
+    feast: FeastClient,
+    definitions: DefinitionsDirectory,
+    assessment: Dict[str, Any],
+    criteria_id: str,
+    features_by_title: Dict[str, str],
+) -> int:
+    """
+    Write the results an existing assessment lacks.
+
+    Studyfyr keeps no report, so the missing results can only come from evaluating again; that happens
+    only when results are missing, and they are added to the existing assessment rather than recorded
+    as a second one. The dataset is a finished extraction, so the evaluation yields the same values.
+
+    :return: how many results were added
+    """
+    assessment_id = assessment.get("qualityAssessmentId")
+    results = passport.quality_results(assessment_id)
+    if len(results) >= _expected_results(passport, assessment):
+        logger.info("  = QualityAssessment against %s already recorded for this dataset", criteria_id)
+        return 0
+
+    logger.info("  ~ QualityAssessment %s lacks results: evaluating again to complete it", assessment_id)
+    report = feast.evaluate_quality(config.dataset_id, criteria_id)
+    url, _version = split_canonical((report.get("criteria") or {}).get("url"))
+    quality_criteria_id = assessment.get("qualityCriteriaId")
+    criterion_by_name = _sync_criterion(
+        passport, definitions, quality_criteria_id, url, criteria_id, report, features_by_title
+    )
+    return _record_results(passport, assessment_id, report, criterion_by_name, results)
 
 
 def _sync_criterion(
@@ -488,6 +608,12 @@ def _sync_criterion(
         name = rule.get("name")
         if name in by_name:
             continue
+        # Studyfyr's rule format nests the Kahn classification ("category": {context, category[,
+        # subcategory]}) and the acceptance test ("rule": {expression, low, high}); the Passport stores
+        # both flat. Already-flat fields are accepted too.
+        category = rule.get("category")
+        classification = category if isinstance(category, dict) else {"category": category}
+        acceptance = rule.get("rule") if isinstance(rule.get("rule"), dict) else {}
         created = passport.post(
             "/quality-criterion",
             {
@@ -495,14 +621,14 @@ def _sync_criterion(
                 "featureId": features_by_title.get(rule.get("feature") or name),
                 "name": name,
                 "description": rule.get("description"),
-                "category": rule.get("category"),
-                "context": rule.get("context"),
-                "subcategory": rule.get("subcategory"),
-                "language": rule.get("language") or ("text/fhirpath" if rule.get("expression") else None),
+                "category": classification.get("category"),
+                "context": classification.get("context") or rule.get("context"),
+                "subcategory": classification.get("subcategory") or rule.get("subcategory"),
+                "language": rule.get("language") or ("application/sql" if rule.get("expression") else None),
                 "expression": rule.get("expression"),
-                "ruleExpression": rule.get("ruleExpression"),
-                "low": rule.get("low"),
-                "high": rule.get("high"),
+                "ruleExpression": acceptance.get("expression") or rule.get("ruleExpression"),
+                "low": acceptance.get("low", rule.get("low")),
+                "high": acceptance.get("high", rule.get("high")),
             },
         )
         by_name[name] = created.get("qualityCriterionId")
@@ -515,22 +641,33 @@ def _record_assessment(
     passport: PassportClient,
     dataset: Dict[str, Any],
     quality_criteria_id: str,
+    criteria_id: str,
     report: Dict[str, Any],
     criterion_by_name: Dict[str, str],
-) -> None:
-    """Record one run of a criteria set over the dataset, with a result per rule."""
+) -> bool:
+    """
+    Record one run of a criteria set over the dataset, with a result per rule.
+
+    :return: whether a new assessment was recorded
+    """
     dataset_id = dataset.get("datasetId")
     results = report.get("results") or []
     passed = [r for r in results if r.get("passed")]
     executed_at = _as_instant(report.get("issued"))
 
-    existing = passport.quality_assessments(dataset_id)
-    if any(
-        a.get("qualityCriteriaId") == quality_criteria_id and a.get("executedAt") == executed_at
-        for a in existing
-    ):
+    existing = next(
+        (
+            a
+            for a in passport.quality_assessments(dataset_id)
+            if a.get("qualityCriteriaId") == quality_criteria_id and a.get("executedAt") == executed_at
+        ),
+        None,
+    )
+    if existing:
         logger.info("  = QualityAssessment for %s already recorded", executed_at)
-        return
+        assessment_id = existing.get("qualityAssessmentId")
+        _record_results(passport, assessment_id, report, criterion_by_name, passport.quality_results(assessment_id))
+        return False
 
     assessment = passport.post(
         "/quality-assessment",
@@ -538,21 +675,54 @@ def _record_assessment(
             "datasetId": dataset_id,
             "qualityCriteriaId": quality_criteria_id,
             "overallResult": "PASSED" if len(passed) == len(results) else "FAILED",
-            "summary": f"{len(passed)} of {len(results)} criteria passed.",
+            # names the Studyfyr definition, which is how a re-run recognises this assessment
+            "summary": f"{len(passed)} of {len(results)} criteria passed {_criteria_marker(criteria_id)}.",
             "executedAt": executed_at,
             "executedBy": "dataset-sync",
         },
     )
     logger.info("  + QualityAssessment created (%s of %s passed)", len(passed), len(results))
+    _record_results(passport, assessment.get("qualityAssessmentId"), report, criterion_by_name, [])
+    return True
 
-    for result in results:
+
+def _record_results(
+    passport: PassportClient,
+    assessment_id: str,
+    report: Dict[str, Any],
+    criterion_by_name: Dict[str, str],
+    existing: List[Dict[str, Any]],
+) -> int:
+    """
+    Record the report's per-rule results under an assessment, leaving out those it already has.
+
+    A result is identified by its criterion, or by its detail when the rule has no criterion record.
+
+    :return: how many results were added
+    """
+
+    def key(criterion_id: Optional[str], detail: Optional[str]) -> tuple:
+        return ("criterion", criterion_id) if criterion_id else ("detail", detail)
+
+    have = {key(r.get("qualityCriterionId"), r.get("detail")) for r in existing}
+    added = 0
+    for result in report.get("results") or []:
+        criterion_id = criterion_by_name.get(result.get("name"))
+        identity = key(criterion_id, result.get("description"))
+        if identity in have:
+            continue
+        have.add(identity)
         passport.post(
             "/quality-criterion-assessment-result",
             {
-                "qualityAssessmentId": assessment.get("qualityAssessmentId"),
-                "qualityCriterionId": criterion_by_name.get(result.get("name")),
+                "qualityAssessmentId": assessment_id,
+                "qualityCriterionId": criterion_id,
                 "value": result.get("value"),
                 "result": "PASSED" if result.get("passed") else "FAILED",
                 "detail": result.get("description"),
             },
         )
+        added += 1
+    if existing and added:
+        logger.info("  + %s missing QualityCriterionAssessmentResult(s) added", added)
+    return added

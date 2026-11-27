@@ -7,7 +7,7 @@ module converges on the same records instead of creating a second set. The proto
 everything on every run, which made them unusable on a schedule.
 
 Idempotency is keyed on whatever identifies the record in the domain - ``(url, version)`` for a
-definition, ``(featuresetId, populationId, organizationId, version)`` for a dataset - not on a
+definition, the Studyfyr extraction job id recorded in ``wasGeneratedBy`` for a dataset - not on a
 synthetic key, because the node does not control the Passport's ids.
 """
 
@@ -172,8 +172,18 @@ class PassportClient:
         return self.get("/feature", {"featuresetId": featureset_id}) or []
 
     def datasets(self) -> List[Dict[str, Any]]:
-        """All datasets of the study."""
+        """
+        All datasets of the study.
+
+        Passport versions before the dataset listing fix return a projection here that leaves out,
+        among others, ``wasGeneratedBy`` and ``previousDatasetId`` (null in the listing). Use
+        :meth:`dataset` where those fields matter, which works with any version.
+        """
         return self.get("/dataset") or []
+
+    def dataset(self, dataset_id: str) -> Optional[Dict[str, Any]]:
+        """One dataset with all its fields."""
+        return self.get(f"/dataset/{dataset_id}")
 
     def dataset_characteristics(self, dataset_id: str) -> List[Dict[str, Any]]:
         """The feature characteristics recorded against one dataset."""
@@ -192,6 +202,12 @@ class PassportClient:
         """The quality assessments recorded against one dataset."""
         return self.get("/quality-assessment", {"datasetId": dataset_id}) or []
 
+    def quality_results(self, quality_assessment_id: str) -> List[Dict[str, Any]]:
+        """The per-criterion results of one quality assessment."""
+        return self.get(
+            "/quality-criterion-assessment-result", {"qualityAssessmentId": quality_assessment_id}
+        ) or []
+
     def catalogue_datasets(self, dataset_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """The publication records of the study, optionally for one dataset."""
         params = {"datasetId": dataset_id} if dataset_id else None
@@ -208,6 +224,10 @@ class PassportClient:
     def model_evaluations(self, model_id: str) -> List[Dict[str, Any]]:
         """The evaluation runs of one model."""
         return self.get("/model-evaluation", {"modelId": model_id}) or []
+
+    def evaluation_measures(self, model_evaluation_id: str) -> List[Dict[str, Any]]:
+        """The measures of one evaluation run."""
+        return self.get("/evaluation-measure", {"modelEvaluationId": model_evaluation_id}) or []
 
     def models(self) -> List[Dict[str, Any]]:
         """All models of the study."""
